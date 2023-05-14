@@ -32,6 +32,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
+import torch.cuda.profiler as profiler
+
 from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
@@ -259,7 +261,25 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    
+    grad_dump_epochs = [1, 50, 100]
+    target_iter = -1
+
+    val_period = 10
+
+    start_iter = 0
+    stop_iter = 100
+
+    idx = 0
+
+    die_epochs = [499]
+  
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        
+        if epoch in die_epochs: 
+            raise Exception("die")
+
         callbacks.run('on_train_epoch_start')
         model.train()
 
@@ -281,7 +301,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+
+
+        #grad_collected = False
+
+        for i, (imgs, targets, paths, _) in pbar:
+            
+
+             
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -296,6 +323,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+
+            
+            # if RANK==0 and idx==start_iter:
+            #     print("START")
+            #     profiler.start()
 
             # Multi-scale
             if opt.multi_scale:
@@ -317,6 +349,21 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             scaler.scale(loss).backward()
 
+            #GRAD EXTRACTION
+            # if RANK==0 and (epoch in grad_dump_epochs) and (not grad_collected) and (opt.name=="baseline_s_grad_ex"):
+            #     grad_collected=True
+            #     g = torch.Tensor().cuda(0)
+            #     for params in model.parameters():
+            #         t = params.grad
+            #         t = torch.flatten(t)
+            #         g = torch.cat((g,t))
+
+            #     g = g[~torch.isnan(g)]
+            #     g = g[~torch.isinf(g)]
+            #     g_np = g.cpu().numpy()
+            #     np.savetxt('./grads/'+ opt.name + '/GPU0_' + str(epoch+400) + '.txt', g_np)
+            
+
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
@@ -327,7 +374,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
-
+            
+            # if RANK==0 and idx==stop_iter:
+            #     print("STOP")
+            #     profiler.stop()
+            
+            idx+=1 
+            
+            # if idx>stop_iter:
+            #     break
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -343,12 +398,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
+        # if idx>=stop_iter:
+        #         break
+
+     
+
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
+
+            if epoch%val_period==0 or final_epoch:  # Calculate mAP
                 results, maps, _ = validate.run(data_dict,
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
@@ -361,35 +422,34 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss)
 
-            # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-            if fi > best_fitness:
-                best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
-            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+                # Update best mAP
+                fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+                stop = stopper(epoch=epoch, fitness=fi)  # early stop check
+                if fi > best_fitness:
+                    best_fitness = fi
+                log_vals = list(mloss) + list(results) + lr
+                callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
-            # Save model
-            if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {
-                    'epoch': epoch,
-                    'best_fitness': best_fitness,
-                    'model': deepcopy(de_parallel(model)).half(),
-                    'ema': deepcopy(ema.ema).half(),
-                    'updates': ema.updates,
-                    'optimizer': optimizer.state_dict(),
-                    'opt': vars(opt),
-                    'git': GIT_INFO,  # {remote, branch, commit} if a git repo
-                    'date': datetime.now().isoformat()}
+                if (not nosave) or (final_epoch and not evolve):  # if save
+                    ckpt = {
+                        'epoch': epoch,
+                        'best_fitness': best_fitness,
+                        'model': deepcopy(de_parallel(model)).half(),
+                        'ema': deepcopy(ema.ema).half(),
+                        'updates': ema.updates,
+                        'optimizer': optimizer.state_dict(),
+                        'opt': vars(opt),
+                        'git': GIT_INFO,  # {remote, branch, commit} if a git repo
+                        'date': datetime.now().isoformat()}
 
-                # Save last, best and delete
-                torch.save(ckpt, last)
-                if best_fitness == fi:
-                    torch.save(ckpt, best)
-                if opt.save_period > 0 and epoch % opt.save_period == 0:
-                    torch.save(ckpt, w / f'epoch{epoch}.pt')
-                del ckpt
-                callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+                    # Save last, best and delete
+                    torch.save(ckpt, last)
+                    if best_fitness == fi:
+                        torch.save(ckpt, best)
+                    if opt.save_period > 0 and epoch % opt.save_period == 0:
+                        torch.save(ckpt, w / f'epoch{epoch}.pt')
+                    del ckpt
+                    callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
         # EarlyStopping
         if RANK != -1:  # if DDP training
@@ -437,7 +497,7 @@ def parse_opt(known=False):
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
+    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.VOC.yaml', help='hyperparameters path') #CHANGED THIS TO VOC
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
