@@ -265,20 +265,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     grad_dump_epochs = [1, 50, 100]
     target_iter = -1
 
-    val_period = 10
+    val_period = 100
 
-    start_iter = 0
-    stop_iter = 100
+    start_iter = 200
+    stop_iter = 500
 
     idx = 0
 
-    die_epochs = [499]
+    # die_epochs = [602]
   
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
-        
-        if epoch in die_epochs: 
-            raise Exception("die")
 
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -307,6 +304,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         for i, (imgs, targets, paths, _) in pbar:
             
+            if RANK==0 and idx==start_iter:
+                print("START")
+                profiler.start()
 
              
             callbacks.run('on_train_batch_start')
@@ -314,20 +314,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
-            if ni <= nw:
-                xi = [0, nw]  # x interp
-                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
-                for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
-                    if 'momentum' in x:
-                        x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
+            # if ni <= nw:
+            #     xi = [0, nw]  # x interp
+            #     # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+            #     accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+            #     for j, x in enumerate(optimizer.param_groups):
+            #         # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+            #         x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 0 else 0.0, x['initial_lr'] * lf(epoch)])
+            #         if 'momentum' in x:
+            #             x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
             
-            # if RANK==0 and idx==start_iter:
-            #     print("START")
-            #     profiler.start()
+            
 
             # Multi-scale
             if opt.multi_scale:
@@ -375,31 +373,31 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ema.update(model)
                 last_opt_step = ni
             
-            # if RANK==0 and idx==stop_iter:
-            #     print("STOP")
-            #     profiler.stop()
+            if RANK==0 and idx==stop_iter:
+                print("STOP")
+                profiler.stop()
             
             idx+=1 
             
-            # if idx>stop_iter:
+            # if idx>=stop_iter:
             #     break
             # Log
-            if RANK in {-1, 0}:
-                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
-                                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
-                if callbacks.stop_training:
-                    return
-            # end batch ------------------------------------------------------------------------------------------------
+            # if RANK in {-1, 0}:
+            #     mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            #     mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+            #     pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+            #                          (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+            #     callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+            #     if callbacks.stop_training:
+            #         return
+            # # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
         # if idx>=stop_iter:
-        #         break
+        #     break
 
      
 
@@ -451,17 +449,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     del ckpt
                     callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
-        # EarlyStopping
-        if RANK != -1:  # if DDP training
-            broadcast_list = [stop if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-            if RANK != 0:
-                stop = broadcast_list[0]
-        if stop:
-            break  # must break all DDP ranks
+        # if epoch in die_epochs: 
+        #     raise Exception("die")
+
+
+
+        # # EarlyStopping
+        # if RANK != -1:  # if DDP training
+        #     broadcast_list = [stop if RANK == 0 else None]
+        #     dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+        #     if RANK != 0:
+        #         stop = broadcast_list[0]
+        # if stop:
+        #     break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
-    # end training -----------------------------------------------------------------------------------------------------
+    #end training -----------------------------------------------------------------------------------------------------
     if RANK in {-1, 0}:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
         for f in last, best:
